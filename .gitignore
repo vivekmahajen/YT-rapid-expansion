@@ -4,6 +4,8 @@ token.json
 
 # Runtime output
 creator_subscribers.csv
+outreach_state.json
+outreach_state.json.tmp
 outreach.log
 outreach.log.*
 

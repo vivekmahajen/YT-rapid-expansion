@@ -24,6 +24,7 @@ https://console.cloud.google.com before running at full scale.
 """
 
 import csv
+import json
 import logging
 import os
 from datetime import datetime
@@ -50,6 +51,9 @@ RUNS_PER_DAY = 5
 
 # Output CSV for the ranked creator-subscriber list
 REPORT_FILE = "creator_subscribers.csv"
+
+# Persistent state file — tracks last posted video and per-creator outreach history
+STATE_FILE = "outreach_state.json"
 
 # Rotating log file (max 5 MB × 3 backups)
 LOG_FILE = "outreach.log"
@@ -90,6 +94,58 @@ _file_handler.setFormatter(_fmt)
 log.addHandler(_file_handler)
 
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def load_state():
+    """
+    Load persistent outreach state from STATE_FILE.
+
+    State schema:
+        last_posted_video_id  : str | None   — video ID of the last successful community post
+        last_posted_at        : str | None   — ISO timestamp of that post
+        creator_subscribers   : dict         — keyed by channel_id:
+            first_seen              : str   — date string (YYYY-MM-DD) when first identified
+            community_post_sent     : bool  — True once a community post went out while subscribed
+            community_post_sent_date: str | None — date of that post
+
+    Quota cost: 0 (local I/O only)
+    Returns: state dict (never raises — returns a fresh default on any error)
+    """
+    default = {
+        "last_posted_video_id": None,
+        "last_posted_at": None,
+        "creator_subscribers": {},
+    }
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        # Ensure all top-level keys exist in case the file is from an older version
+        for key, val in default.items():
+            state.setdefault(key, val)
+        log.info("State loaded from %s (%d known creator-subscribers).",
+                 STATE_FILE, len(state["creator_subscribers"]))
+        return state
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Could not read state file (%s) — starting with fresh state.", exc)
+        return default
+
+
+def save_state(state):
+    """
+    Persist outreach state to STATE_FILE atomically (write to .tmp then rename).
+
+    Quota cost: 0 (local I/O only)
+    """
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, STATE_FILE)
+        log.info("State saved to %s.", STATE_FILE)
+    except OSError as exc:
+        log.error("Failed to save state file: %s", exc)
 
 
 def get_authenticated_service():
@@ -364,7 +420,8 @@ def save_creator_report(creator_subscribers):
     Rows are sorted by subscriber_count descending.
 
     Quota cost: 0 (local I/O only)
-    Columns: title, subscriber_count, video_count, channel_url, description, channel_id
+    Columns: title, subscriber_count, video_count, channel_url, description,
+             channel_id, first_seen, community_post_sent, community_post_sent_date
     """
     if not creator_subscribers:
         log.warning("No creator-subscribers to save — skipping CSV write.")
@@ -381,10 +438,13 @@ def save_creator_report(creator_subscribers):
         "channel_url",
         "description",
         "channel_id",
+        "first_seen",
+        "community_post_sent",
+        "community_post_sent_date",
     ]
 
     with open(REPORT_FILE, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(sorted_creators)
 
@@ -399,68 +459,120 @@ def save_creator_report(creator_subscribers):
 
 def run_outreach_job():
     """
-    Orchestrate one complete outreach run in 8 sequential steps:
+    Orchestrate one complete outreach run in 9 sequential steps:
 
-    1. Authenticate with YouTube API
-    2. Resolve own channel ID
-    3. Fetch the latest uploaded video
-    4. Fetch all public subscribers
-    5. Batch-fetch channel stats for each subscriber
-    6. Filter by CREATOR_MIN_SUBSCRIBERS threshold
-    7. Save ranked CSV report
-    8. Post Community Post with latest video link
+    1. Load persistent state
+    2. Authenticate with YouTube API
+    3. Resolve own channel ID
+    4. Fetch the latest uploaded video
+    5. Fetch all public subscribers
+    6. Batch-fetch channel stats for each subscriber
+    7. Filter by CREATOR_MIN_SUBSCRIBERS, merge with state (first_seen / post history)
+    8. Save ranked CSV report
+    9. Post Community Post only if this video hasn't been posted before; update state
     """
     log.info("=" * 60)
     log.info("OUTREACH JOB START  %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
 
-    # Step 1 — Authenticate
+    # Step 1 — Load state
+    state = load_state()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Step 2 — Authenticate
     youtube = get_authenticated_service()
 
-    # Step 2 — Own channel ID
+    # Step 3 — Own channel ID
     channel_id = get_my_channel_id(youtube)
     if not channel_id:
         log.error("Cannot proceed without channel ID. Aborting run.")
         return
 
-    # Step 3 — Latest video
+    # Step 4 — Latest video
     video_id, video_title = get_latest_video(youtube, channel_id)
     video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
     if not video_id:
         log.warning("No video found — Community Post will be skipped this run.")
 
-    # Step 4 — All public subscribers
+    # Step 5 — All public subscribers
     subscriber_ids = get_all_subscribers(youtube)
 
+    creator_subscribers = []
     if subscriber_ids:
-        # Step 5 — Batch stats
+        # Step 6 — Batch stats
         all_stats = get_channel_stats_batch(youtube, subscriber_ids)
 
-        # Step 6 — Filter creators
-        creator_subscribers = [
-            ch for ch in all_stats if ch["subscriber_count"] >= CREATOR_MIN_SUBSCRIBERS
-        ]
+        # Step 7 — Filter creators and merge with persistent state
+        known = state["creator_subscribers"]
+        for ch in all_stats:
+            if ch["subscriber_count"] < CREATOR_MIN_SUBSCRIBERS:
+                continue
+            cid = ch["channel_id"]
+            record = known.get(cid, {})
+            ch["first_seen"] = record.get("first_seen", today)
+            ch["community_post_sent"] = record.get("community_post_sent", False)
+            ch["community_post_sent_date"] = record.get("community_post_sent_date")
+            creator_subscribers.append(ch)
+
+        new_count = sum(
+            1 for ch in creator_subscribers
+            if ch["first_seen"] == today and ch["channel_id"] not in known
+        )
         log.info(
-            "Creator-subscribers: %d / %d (threshold ≥ %s subs)",
-            len(creator_subscribers),
-            len(all_stats),
-            f"{CREATOR_MIN_SUBSCRIBERS:,}",
+            "Creator-subscribers: %d total / %d new this run (threshold ≥ %s subs)",
+            len(creator_subscribers), new_count, f"{CREATOR_MIN_SUBSCRIBERS:,}",
         )
 
-        # Step 7 — Save report
+        # Step 8 — Save report (includes first_seen, community_post_sent columns)
         save_creator_report(creator_subscribers)
     else:
         log.warning("No public subscribers returned — skipping stats fetch and CSV export.")
 
-    # Step 8 — Community Post
+    # Step 9 — Community Post (skip if this video was already posted)
+    post_sent = False
     if video_id and video_title:
-        message = COMMUNITY_POST_TEMPLATE.format(
-            video_title=video_title,
-            video_url=video_url,
-        )
-        post_community_post(youtube, message)
+        if state["last_posted_video_id"] == video_id:
+            log.info(
+                "Community Post skipped — video '%s' was already posted on %s.",
+                video_title, state.get("last_posted_at", "unknown date"),
+            )
+        else:
+            message = COMMUNITY_POST_TEMPLATE.format(
+                video_title=video_title,
+                video_url=video_url,
+            )
+            post_sent = post_community_post(youtube, message)
+
+            if post_sent:
+                # Record which video was posted
+                state["last_posted_video_id"] = video_id
+                state["last_posted_at"] = datetime.now().isoformat()
+
+                # Mark every creator-subscriber currently in the list as reached
+                for ch in creator_subscribers:
+                    cid = ch["channel_id"]
+                    entry = state["creator_subscribers"].setdefault(cid, {})
+                    entry["first_seen"] = ch["first_seen"]
+                    if not entry.get("community_post_sent"):
+                        entry["community_post_sent"] = True
+                        entry["community_post_sent_date"] = today
+                        ch["community_post_sent"] = True
+                        ch["community_post_sent_date"] = today
+
+                # Re-save CSV now that community_post_sent flags are updated
+                save_creator_report(creator_subscribers)
     else:
         log.warning("Skipping Community Post — no video available.")
+
+    # Persist any new first_seen records even if no post was sent
+    for ch in creator_subscribers:
+        cid = ch["channel_id"]
+        entry = state["creator_subscribers"].setdefault(cid, {})
+        entry.setdefault("first_seen", ch["first_seen"])
+        entry.setdefault("community_post_sent", ch["community_post_sent"])
+        entry.setdefault("community_post_sent_date", ch["community_post_sent_date"])
+
+    save_state(state)
 
     log.info("OUTREACH JOB END    %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
