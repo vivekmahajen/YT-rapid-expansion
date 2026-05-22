@@ -1,0 +1,24 @@
+# OAuth credentials — never commit these
+client_secrets.json
+token.json
+
+# Runtime output
+creator_subscribers.csv
+outreach.log
+outreach.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
