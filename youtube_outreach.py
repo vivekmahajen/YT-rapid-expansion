@@ -57,6 +57,40 @@ REPORT_FILE = "creator_subscribers.csv"
 # Persistent state file — tracks last posted video and per-creator outreach history
 STATE_FILE = "outreach_state.json"
 
+# How many days between polls (1 = one poll per day, 2 = every other day, etc.)
+POLL_FREQUENCY_DAYS = 1
+
+# Poll templates — rotated in order, one per POLL_FREQUENCY_DAYS interval
+POLL_TEMPLATES = [
+    {
+        "question": "What's your biggest money struggle right now?",
+        "options": [
+            "Too much debt",
+            "Can't save consistently",
+            "Don't know how to invest",
+            "Saving for a big purchase",
+        ],
+    },
+    {
+        "question": "What should I cover next?",
+        "options": [
+            "How to invest your first $1,000",
+            "Side hustles that actually pay",
+            "Paying off student loans faster",
+            "Getting out of credit card debt",
+        ],
+    },
+    {
+        "question": "Which one are you?",
+        "options": [
+            "Spender trying to save",
+            "Saver afraid to invest",
+            "No budget, no plan",
+            "Spreadsheet for everything",
+        ],
+    },
+]
+
 # Rotating log file (max 5 MB × 3 backups)
 LOG_FILE = "outreach.log"
 
@@ -119,6 +153,8 @@ def load_state():
     default = {
         "last_posted_video_id": None,
         "last_posted_at": None,
+        "last_poll_date": None,
+        "last_poll_index": -1,
         "creator_subscribers": {},
     }
     if not os.path.exists(STATE_FILE):
@@ -418,6 +454,109 @@ def post_community_post(youtube, message):
         return False
 
 
+def post_community_poll(youtube, poll_template):
+    """
+    Publish a poll as a Community Post to all subscribers.
+
+    Rotates through POLL_TEMPLATES in order, one every POLL_FREQUENCY_DAYS days.
+    If the API endpoint is unavailable, logs the poll text for manual posting
+    in YouTube Studio (Create -> Create post -> Add poll).
+
+    Quota cost: 50 units
+    Returns: True on success, False on failure
+    """
+    question = poll_template["question"]
+    options = poll_template["options"]
+
+    log.info("Posting poll: '%s' (%d options)...", question, len(options))
+
+    try:
+        response = youtube.communityPosts().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "type": "pollPost",
+                    "textOriginal": question,
+                    "pollOptions": [{"optionText": opt} for opt in options],
+                }
+            },
+        ).execute()
+
+        post_id = response.get("id", "unknown")
+        log.info("Poll published successfully. Post ID: %s", post_id)
+        return True
+
+    except googleapiclient.errors.HttpError as exc:
+        status = exc.resp.status
+        if status == 403:
+            log.warning(
+                "Poll blocked (403 Forbidden). Channel may not meet eligibility requirements. "
+                "Post manually via YouTube Studio. Full error: %s", exc,
+            )
+        else:
+            log.error("Poll failed (HTTP %s): %s", status, exc)
+        _log_poll_for_manual_posting(question, options)
+        return False
+
+    except AttributeError:
+        log.warning(
+            "communityPosts() endpoint not available in this API client version. "
+            "Post this poll manually via YouTube Studio -> Create -> Create post -> Add poll."
+        )
+        _log_poll_for_manual_posting(question, options)
+        return False
+
+
+def _log_poll_for_manual_posting(question, options):
+    """Print the poll content clearly so it can be copy-pasted into YouTube Studio."""
+    log.info("--- POLL TO POST MANUALLY ---")
+    log.info("Question: %s", question)
+    for i, opt in enumerate(options, 1):
+        log.info("  Option %d: %s", i, opt)
+    log.info("-----------------------------")
+
+
+def maybe_post_poll(youtube, state, today):
+    """
+    Post the next poll in rotation if POLL_FREQUENCY_DAYS have passed since the last one.
+
+    Checks state['last_poll_date'] and only fires once per POLL_FREQUENCY_DAYS interval
+    regardless of how many scheduler runs happen in a day.
+
+    Quota cost: 50 units when a poll is posted, 0 units when skipped
+    Returns: updated state dict
+    """
+    last_poll_date = state.get("last_poll_date")
+
+    if last_poll_date:
+        from datetime import date, timedelta
+        last = date.fromisoformat(last_poll_date)
+        today_date = date.fromisoformat(today)
+        days_since = (today_date - last).days
+        if days_since < POLL_FREQUENCY_DAYS:
+            log.info(
+                "Poll skipped — last poll was %d day(s) ago (frequency: every %d day(s)).",
+                days_since, POLL_FREQUENCY_DAYS,
+            )
+            return state
+
+    # Advance to next poll in rotation
+    next_index = (state.get("last_poll_index", -1) + 1) % len(POLL_TEMPLATES)
+    poll = POLL_TEMPLATES[next_index]
+
+    success = post_community_poll(youtube, poll)
+
+    # Update state regardless of API success so the manual-post reminder
+    # doesn't repeat on every run within the same day
+    state["last_poll_date"] = today
+    state["last_poll_index"] = next_index
+    log.info(
+        "Poll rotation: index %d / %d — next poll in %d day(s).",
+        next_index + 1, len(POLL_TEMPLATES), POLL_FREQUENCY_DAYS,
+    )
+    return state
+
+
 def save_creator_report(creator_subscribers):
     """
     Write the filtered creator-subscriber list to REPORT_FILE as CSV.
@@ -475,6 +614,7 @@ def run_outreach_job():
     7. Filter by CREATOR_MIN_SUBSCRIBERS, merge with state (first_seen / post history)
     8. Save ranked CSV report
     9. Post Community Post only if this video hasn't been posted before; update state
+    10. Post rotating poll once per POLL_FREQUENCY_DAYS
     """
     log.info("=" * 60)
     log.info("OUTREACH JOB START  %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -568,6 +708,9 @@ def run_outreach_job():
                 save_creator_report(creator_subscribers)
     else:
         log.warning("Skipping Community Post — no video available.")
+
+    # Step 10 — Rotating poll (once per POLL_FREQUENCY_DAYS)
+    state = maybe_post_poll(youtube, state, today)
 
     # Persist any new first_seen records even if no post was sent
     for ch in creator_subscribers:
