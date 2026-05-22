@@ -46,7 +46,7 @@ CLIENT_SECRETS_FILE = "client_secrets.json"
 TOKEN_FILE = "token.json"
 
 # Minimum subscriber count for a subscriber to be flagged as a creator
-CREATOR_MIN_SUBSCRIBERS = 500
+CREATOR_MIN_SUBSCRIBERS = 5
 
 # How many times per day to run (spread evenly between 7 AM – 11 PM)
 RUNS_PER_DAY = 5
