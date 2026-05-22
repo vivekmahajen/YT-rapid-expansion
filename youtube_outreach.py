@@ -24,9 +24,11 @@ https://console.cloud.google.com before running at full scale.
 """
 
 import csv
+import io
 import json
 import logging
 import os
+import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
@@ -85,7 +87,10 @@ _fmt = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-_console = logging.StreamHandler()
+# Force UTF-8 on the console so Unicode in video titles / emoji never crashes on Windows
+_console = logging.StreamHandler(
+    stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+)
 _console.setFormatter(_fmt)
 log.addHandler(_console)
 
@@ -449,7 +454,7 @@ def save_creator_report(creator_subscribers):
         writer.writerows(sorted_creators)
 
     log.info(
-        "Creator report saved → %s (%d entries, top: '%s' with %s subs)",
+        "Creator report saved -> %s (%d entries, top: '%s' with %s subs)",
         REPORT_FILE,
         len(sorted_creators),
         sorted_creators[0]["title"],
@@ -519,7 +524,7 @@ def run_outreach_job():
             if ch["first_seen"] == today and ch["channel_id"] not in known
         )
         log.info(
-            "Creator-subscribers: %d total / %d new this run (threshold ≥ %s subs)",
+            "Creator-subscribers: %d total / %d new this run (threshold >= %s subs)",
             len(creator_subscribers), new_count, f"{CREATOR_MIN_SUBSCRIBERS:,}",
         )
 
@@ -627,7 +632,7 @@ def main():
 
     log.info("Scheduling %d daily runs:", len(run_times))
     for hour, minute in run_times:
-        log.info("  → %02d:%02d", hour, minute)
+        log.info("  -> %02d:%02d", hour, minute)
         scheduler.add_job(
             run_outreach_job,
             trigger=CronTrigger(hour=hour, minute=minute),
